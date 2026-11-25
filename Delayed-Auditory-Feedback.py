@@ -166,7 +166,6 @@ class DAFApp(ctk.CTk):
         ctk.set_default_color_theme("blue")
 
         self.title(APP_TITLE)
-        self.geometry("500x560")
         self.resizable(False, False)
         self.configure(fg_color=COLORS["bg"])
 
@@ -189,6 +188,11 @@ class DAFApp(ctk.CTk):
 
         self._build_ui()
         self._refresh_devices(restore_saved=True)
+
+        # 依實際排版高度自動調整視窗大小，確保所有按鈕與狀態列完整顯示
+        self.update_idletasks()
+        target_h = max(620, self.winfo_reqheight() + 8)
+        self.geometry(f"500x{target_h}")
 
         self.protocol("WM_DELETE_WINDOW", self.on_closing)
 
@@ -627,6 +631,76 @@ class DAFApp(ctk.CTk):
         else:
             self.stop_daf()
 
+    def _find_fallback_device_pair(self, input_name: str, output_name: str) -> tuple[int, int] | None:
+        """若 WASAPI 裝置取樣率不相容，嘗試尋找同名的 DirectSound 裝置作為備援。"""
+        try:
+            devices = sd.query_devices()
+            hostapis = sd.query_hostapis()
+        except Exception:
+            return None
+
+        for api_name in ("Windows DirectSound", "MME"):
+            api_idx = next((i for i, a in enumerate(hostapis) if a.get("name") == api_name), None)
+            if api_idx is None:
+                continue
+            in_id = next(
+                (i for i, d in enumerate(devices)
+                 if d.get("hostapi") == api_idx and d["max_input_channels"] > 0 and d["name"].strip() == input_name),
+                None,
+            )
+            out_id = next(
+                (i for i, d in enumerate(devices)
+                 if d.get("hostapi") == api_idx and d["max_output_channels"] > 0 and d["name"].strip() == output_name),
+                None,
+            )
+            if in_id is not None and out_id is not None:
+                return (in_id, out_id)
+        return None
+
+    def _open_audio_stream(self, input_dev_id: int, output_dev_id: int, input_name: str, output_name: str) -> sd.Stream:
+        """依裝置支援的取樣率自動挑選並開啟音訊串流。"""
+        candidates: list[int] = []
+        try:
+            in_info = sd.query_devices(input_dev_id)
+            out_info = sd.query_devices(output_dev_id)
+            for sr in (int(in_info["default_samplerate"]), int(out_info["default_samplerate"]), 48000, 44100):
+                if sr > 0 and sr not in candidates:
+                    candidates.append(sr)
+        except Exception:
+            candidates = [48000, 44100]
+
+        last_err: Exception | None = None
+        pairs_to_try: list[tuple[int, int]] = [(input_dev_id, output_dev_id)]
+        fallback_pair = self._find_fallback_device_pair(input_name, output_name)
+        if fallback_pair and fallback_pair not in pairs_to_try:
+            pairs_to_try.append(fallback_pair)
+
+        for dev_pair in pairs_to_try:
+            for sr in candidates:
+                stream = None
+                try:
+                    stream = sd.Stream(
+                        device=dev_pair,
+                        samplerate=sr,
+                        blocksize=self.blocksize,
+                        channels=self.channels,
+                        dtype="float32",
+                        callback=self._audio_callback,
+                    )
+                    stream.start()
+                    self.sample_rate = sr
+                    return stream
+                except Exception as e:
+                    last_err = e
+                    if stream is not None:
+                        try:
+                            stream.close()
+                        except Exception:
+                            pass
+
+        assert last_err is not None
+        raise last_err
+
     def start_daf(self):
         try:
             val = float(self.delay_entry.get().strip())
@@ -644,22 +718,14 @@ class DAFApp(ctk.CTk):
             ErrorDialog(self, "裝置錯誤", "請選擇有效的輸入與輸出裝置！")
             return
 
-        input_dev_id = in_dev[0]
-        output_dev_id = out_dev[0]
+        input_dev_id, input_name = in_dev
+        output_dev_id, output_name = out_dev
 
         while not self.audio_queue.empty():
             self.audio_queue.get()
 
         try:
-            self.stream = sd.Stream(
-                device=(input_dev_id, output_dev_id),
-                samplerate=self.sample_rate,
-                blocksize=self.blocksize,
-                channels=self.channels,
-                dtype="float32",
-                callback=self._audio_callback,
-            )
-            self.stream.start()
+            self.stream = self._open_audio_stream(input_dev_id, output_dev_id, input_name, output_name)
             self.is_running = True
 
             # 同步保存本次啟動使用的設定
